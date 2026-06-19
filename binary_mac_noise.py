@@ -77,6 +77,22 @@ def bwn_weight_sign(weight_fp, layerwise=True):
     return sign_w
 
 
+def activation_binary_codes(input_moved, input_q, clip_val, symmetric, input_bits):
+    """Binary activation codes for integer MAC simulation.
+
+    - symmetric (Q/K/V, ffn1, output_proj, ...): codes in {-1, 0, +1}
+    - asymmetric unsigned (ffn2, attention probs): codes in {0, 1}
+    """
+    if input_bits >= 32:
+        return input_moved.sign()
+    if symmetric:
+        return input_moved.sign()
+    alpha = clip_val.reshape(()).to(device=input_q.device, dtype=input_q.dtype)
+    eps = torch.tensor(1e-5, device=input_q.device, dtype=input_q.dtype)
+    alpha = torch.where(alpha > eps, alpha, eps)
+    return (input_q / alpha).round().clamp(0, 1)
+
+
 def noisy_binary_linear(sign_input, sign_weight, mac_size, mac_type, input_scale, weight_scale):
     """Integer dot product on signs, optional noise, then apply scales."""
     int_dot = torch.nn.functional.linear(sign_input, sign_weight)
