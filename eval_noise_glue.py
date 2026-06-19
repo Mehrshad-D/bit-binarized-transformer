@@ -85,6 +85,9 @@ def main():
     parser.add_argument('--weight_layerwise', default=True, type=lambda x: bool(int(x)))
     parser.add_argument('--input_layerwise', default=True, type=lambda x: bool(int(x)))
     parser.add_argument('--clip_init_val', default=2.5, type=float)
+    parser.add_argument('--clip_lr', default=1e-4, type=float)
+    parser.add_argument('--clip_wd', default=0.0, type=float)
+    parser.add_argument('--weight_decay', default=0.01, type=float)
 
     args = parser.parse_args()
     args.do_lower_case = True
@@ -163,11 +166,12 @@ def main():
     student_model = BertForSequenceClassification.from_pretrained(
         args.student_model, config=student_config)
     student_model.to(device)
+    student_model.eval()
 
     learner = KDLearner(args, device, student_model, teacher_model=None, num_train_optimization_steps=0)
-    learner.build()
 
     csv_path = os.path.join(args.output_dir, 'noise_sweep_results.csv')
+    fieldnames = ['noise_pct', 'noise_mac_types', 'acc', 'acc_mm', 'eval_loss']
     rows = []
 
     for noise_pct in noise_levels:
@@ -178,9 +182,13 @@ def main():
         MacNoiseConfig.configure(noise_pct, mac_types, enabled=True)
         logging.info('===== Evaluating noise_pct=%.4f =====', noise_pct)
 
-        result, mm_acc = evaluate_once(
-            learner, task_name, output_mode, eval_labels, num_labels,
-            eval_dataloader, eval_examples, mm_eval_dataloader, mm_eval_labels)
+        try:
+            result, mm_acc = evaluate_once(
+                learner, task_name, output_mode, eval_labels, num_labels,
+                eval_dataloader, eval_examples, mm_eval_dataloader, mm_eval_labels)
+        except Exception:
+            logging.exception('Evaluation failed at noise_pct=%s', noise_pct)
+            raise
 
         row = {
             'noise_pct': noise_pct,
@@ -196,13 +204,12 @@ def main():
         if task_name == 'mnli':
             logging.info('noise_pct=%s acc_mm=%s', noise_pct, row.get('acc_mm', ''))
 
-    MacNoiseConfig.reset()
+        with open(csv_path, 'w', newline='') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(rows)
 
-    fieldnames = ['noise_pct', 'noise_mac_types', 'acc', 'acc_mm', 'eval_loss']
-    with open(csv_path, 'w', newline='') as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(rows)
+    MacNoiseConfig.reset()
 
     logging.info('Wrote results to %s', csv_path)
     return 0

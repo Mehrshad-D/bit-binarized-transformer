@@ -500,7 +500,7 @@ class BertPreTrainedModel(nn.Module):
             weights_path = os.path.join(
                 pretrained_model_name_or_path, WEIGHTS_NAME)
             logger.info("Loading model {}".format(weights_path))
-            state_dict = torch.load(weights_path, map_location='cpu')
+            state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
 
         if from_tf:
             # Directly load from a TensorFlow checkpoint
