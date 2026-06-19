@@ -10,6 +10,14 @@ import torch.nn as nn
 import logging
 import math
 
+from binary_mac_noise import (
+    MacNoiseConfig,
+    bwn_weight_scale,
+    bwn_weight_sign,
+    noisy_binary_linear,
+    tensor_scalar,
+)
+
 class LearnableBias(nn.Module):
     def __init__(self, out_chn):
         super(LearnableBias, self).__init__()
@@ -236,8 +244,9 @@ class QuantizeLinear(nn.Linear):
 
     def __init__(self, *kargs, clip_val=2.5, weight_bits=8, input_bits=8, learnable=False, symmetric=True,
                  weight_layerwise=True, input_layerwise=True, weight_quant_method="twn", input_quant_method="uniform",
-                 **kwargs):
+                 mac_type=None, **kwargs):
         super(QuantizeLinear, self).__init__(*kargs, **kwargs)
+        self.mac_type = mac_type
         self.weight_bits = weight_bits
         self.input_bits = input_bits
         self.learnable = learnable
@@ -274,14 +283,26 @@ class QuantizeLinear(nn.Linear):
             self.register_buffer('input_clip_val', None)
 
     def forward(self, input):
-        # quantize weight
         weight = weight_quant_fn(self.weight, self.weight_clip_val, num_bits=self.weight_bits, symmetric=self.symmetric,
                                  quant_method=self.weight_quant_method, layerwise=self.weight_layerwise)
-        # quantize input
         input = self.move(input)
+        input_moved = input
         input = act_quant_fn(input, self.input_clip_val, num_bits=self.input_bits, symmetric=self.symmetric,
                              quant_method=self.input_quant_method, layerwise=self.input_layerwise)
-        out = nn.functional.linear(input, weight)
+
+        if MacNoiseConfig.should_noise(self.mac_type):
+            sign_in = input_moved.sign()
+            if self.weight_quant_method == 'bwn' and self.weight_bits < 32:
+                sign_w = bwn_weight_sign(self.weight, layerwise=self.weight_layerwise)
+            else:
+                sign_w = weight.sign()
+            input_scale = tensor_scalar(self.input_clip_val)
+            weight_scale = float(bwn_weight_scale(self.weight, layerwise=self.weight_layerwise))
+            out = noisy_binary_linear(
+                sign_in, sign_w, self.in_features, self.mac_type, input_scale, weight_scale)
+        else:
+            out = nn.functional.linear(input, weight)
+
         if not self.bias is None:
             out += self.bias.view(1, -1).expand_as(out)
 
