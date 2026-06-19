@@ -47,6 +47,7 @@ from torch.nn.parameter import Parameter
 from .file_utils import WEIGHTS_NAME, CONFIG_NAME
 from .configuration_bert import BertConfig
 from .utils_quant import QuantizeLinear, QuantizeEmbedding, act_quant_fn, AlphaInit
+from binary_mac_noise import MacNoiseConfig, noisy_binary_matmul, tensor_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -174,19 +175,22 @@ class BertSelfAttention(nn.Module):
                                     weight_layerwise=config.weight_layerwise, input_layerwise=config.input_layerwise,
                                     weight_quant_method=config.weight_quant_method,
                                     input_quant_method=config.input_quant_method,
-                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo)
+                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo,
+                                    mac_type='qkv')
         self.key = QuantizeLinear(config.hidden_size, self.all_head_size, clip_val=config.clip_init_val,
                                   weight_bits=config.weight_bits, input_bits=config.input_bits,
                                   weight_layerwise=config.weight_layerwise, input_layerwise=config.input_layerwise,
                                   weight_quant_method=config.weight_quant_method,
                                   input_quant_method=config.input_quant_method,
-                                  learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo)
+                                  learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo,
+                                  mac_type='qkv')
         self.value = QuantizeLinear(config.hidden_size, self.all_head_size, clip_val=config.clip_init_val,
                                     weight_bits=config.weight_bits, input_bits=config.input_bits,
                                     weight_layerwise=config.weight_layerwise, input_layerwise=config.input_layerwise,
                                     weight_quant_method=config.weight_quant_method,
                                     input_quant_method=config.input_quant_method,
-                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo)
+                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo,
+                                    mac_type='qkv')
 
         self.move_q = LearnableBias(self.all_head_size)
         self.move_k = LearnableBias(self.all_head_size)
@@ -239,8 +243,15 @@ class BertSelfAttention(nn.Module):
             value_layer = act_quant_fn(value_layer, self.clip_value, self.input_bits, quant_method=self.input_quant_method,
                                        symmetric=self.sym_quant_qkvo, layerwise=self.input_layerwise)
 
-        attention_scores = torch.matmul(
-            query_layer, key_layer.transpose(-1, -2))
+        if MacNoiseConfig.should_noise('attn_score'):
+            attention_scores = noisy_binary_matmul(
+                query_layer.sign(), key_layer.sign(),
+                self.attention_head_size, 'attn_score',
+                tensor_scalar(self.clip_query), tensor_scalar(self.clip_key),
+                transpose_b=True)
+        else:
+            attention_scores = torch.matmul(
+                query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / \
             math.sqrt(self.attention_head_size)
         attention_scores = attention_scores + attention_mask
@@ -253,7 +264,14 @@ class BertSelfAttention(nn.Module):
             attention_probs = act_quant_fn(attention_probs, self.clip_attn, self.input_bits, quant_method=self.input_quant_method,
                                            symmetric=self.sym_quant_ffn_attn, layerwise=self.input_layerwise)
 
-        context_layer = torch.matmul(attention_probs, value_layer)
+        if MacNoiseConfig.should_noise('attn_apply'):
+            seq_len = attention_probs.size(-1)
+            context_layer = noisy_binary_matmul(
+                attention_probs.sign(), value_layer.sign(),
+                seq_len, 'attn_apply',
+                tensor_scalar(self.clip_attn), tensor_scalar(self.clip_value))
+        else:
+            context_layer = torch.matmul(attention_probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[
             :-2] + (self.all_head_size,)
@@ -282,7 +300,8 @@ class BertSelfOutput(nn.Module):
                                     weight_layerwise=config.weight_layerwise, input_layerwise=config.input_layerwise,
                                     weight_quant_method=config.weight_quant_method,
                                     input_quant_method=config.input_quant_method,
-                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo)
+                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo,
+                                    mac_type='output_proj')
 
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -302,7 +321,8 @@ class BertIntermediate(nn.Module):
                                     weight_layerwise=config.weight_layerwise, input_layerwise=config.input_layerwise,
                                     weight_quant_method=config.weight_quant_method,
                                     input_quant_method=config.input_quant_method,
-                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo)
+                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_qkvo,
+                                    mac_type='ffn1')
 
         if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
@@ -323,7 +343,8 @@ class BertOutput(nn.Module):
                                     weight_layerwise=config.weight_layerwise, input_layerwise=config.input_layerwise,
                                     weight_quant_method=config.weight_quant_method,
                                     input_quant_method=config.input_quant_method,
-                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_ffn_attn)
+                                    learnable=config.learnable_scaling, symmetric=config.sym_quant_ffn_attn,
+                                    mac_type='ffn2')
 
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
