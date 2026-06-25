@@ -12,10 +12,10 @@ import math
 
 from binary_mac_noise import (
     MacNoiseConfig,
+    MacOutputCollector,
     activation_binary_codes,
     bwn_weight_scale,
     bwn_weight_sign,
-    noisy_binary_linear,
     tensor_scalar,
 )
 
@@ -291,7 +291,9 @@ class QuantizeLinear(nn.Linear):
         input = act_quant_fn(input, self.input_clip_val, num_bits=self.input_bits, symmetric=self.symmetric,
                              quant_method=self.input_quant_method, layerwise=self.input_layerwise)
 
-        if MacNoiseConfig.should_noise(self.mac_type):
+        do_noise = MacNoiseConfig.should_noise(self.mac_type)
+        do_collect = MacOutputCollector.should_collect(self.mac_type)
+        if do_noise or do_collect:
             bin_in = activation_binary_codes(
                 input_moved, input, self.input_clip_val,
                 self.symmetric, self.input_bits)
@@ -299,10 +301,18 @@ class QuantizeLinear(nn.Linear):
                 sign_w = bwn_weight_sign(self.weight, layerwise=self.weight_layerwise)
             else:
                 sign_w = weight.sign()
-            input_scale = tensor_scalar(self.input_clip_val)
-            weight_scale = float(bwn_weight_scale(self.weight, layerwise=self.weight_layerwise))
-            out = noisy_binary_linear(
-                bin_in, sign_w, self.in_features, self.mac_type, input_scale, weight_scale)
+            int_dot = nn.functional.linear(bin_in, sign_w)
+            if do_collect:
+                MacOutputCollector.record(
+                    self.mac_type, getattr(self, '_mac_layer_idx', -1),
+                    int_dot, self.in_features)
+            if do_noise:
+                input_scale = tensor_scalar(self.input_clip_val)
+                weight_scale = float(bwn_weight_scale(self.weight, layerwise=self.weight_layerwise))
+                noisy = MacNoiseConfig.inject(int_dot, self.in_features, self.mac_type)
+                out = input_scale * weight_scale * noisy
+            else:
+                out = nn.functional.linear(input, weight)
         else:
             out = nn.functional.linear(input, weight)
 

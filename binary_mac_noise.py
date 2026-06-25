@@ -1,6 +1,8 @@
 # coding=utf-8
 """In-DRAM binary MAC noise simulation for evaluation."""
 
+import re
+
 import torch
 
 VALID_MAC_TYPES = frozenset({
@@ -54,6 +56,103 @@ class MacNoiseConfig(object):
             return integer_dot
         noise = torch.randn_like(integer_dot, dtype=torch.float32) * sigma
         return integer_dot.float() + noise
+
+
+class MacOutputCollector(object):
+    """Collect integer binary-MAC outputs for distribution analysis.
+
+    A binary MAC output is the integer dot product of activation codes with
+    weight signs, BEFORE any noise or scale is applied. We accumulate these
+    integers into per-(mac_type, layer) histograms with integer bins. The
+    value range is bounded by +/- mac_size, so bins stay small.
+    """
+
+    enabled = False
+    mac_types = frozenset()
+    _hists = {}
+
+    @classmethod
+    def configure(cls, mac_types, enabled=True):
+        unknown = set(mac_types) - VALID_MAC_TYPES
+        if unknown:
+            raise ValueError(
+                'Unknown mac_types: %s. Valid: %s' % (unknown, sorted(VALID_MAC_TYPES)))
+        cls.enabled = enabled
+        cls.mac_types = frozenset(mac_types)
+        cls._hists = {}
+
+    @classmethod
+    def reset(cls):
+        cls.enabled = False
+        cls.mac_types = frozenset()
+        cls._hists = {}
+
+    @classmethod
+    def should_collect(cls, mac_type):
+        return cls.enabled and mac_type is not None and mac_type in cls.mac_types
+
+    @classmethod
+    def record(cls, mac_type, layer_idx, integer_output, mac_size):
+        if not cls.should_collect(mac_type):
+            return
+        mac_size = int(mac_size)
+        vals = integer_output.detach().reshape(-1).round().to(torch.long).cpu()
+        shifted = (vals + mac_size).clamp_(0, 2 * mac_size)
+        counts = torch.bincount(shifted, minlength=2 * mac_size + 1)
+        key = (mac_type, int(layer_idx))
+        entry = cls._hists.get(key)
+        if entry is None:
+            cls._hists[key] = {'mac_size': mac_size, 'counts': counts}
+        else:
+            entry['counts'] += counts
+
+    @classmethod
+    def export_rows(cls):
+        """Long-format rows: (mac_type, layer_idx, value, count).
+
+        layer_idx == -1 is the pooled-over-all-layers histogram. Only nonzero
+        bins are emitted to keep the output compact.
+        """
+        rows = []
+        pooled = {}
+        for (mac_type, layer_idx), entry in sorted(cls._hists.items()):
+            mac_size = entry['mac_size']
+            counts = entry['counts']
+            p = pooled.get(mac_type)
+            if p is None:
+                pooled[mac_type] = {'mac_size': mac_size, 'counts': counts.clone()}
+            else:
+                p['counts'] += counts
+            nz = counts.nonzero(as_tuple=False).reshape(-1)
+            for idx in nz.tolist():
+                rows.append((mac_type, layer_idx, idx - mac_size, int(counts[idx].item())))
+        for mac_type, p in sorted(pooled.items()):
+            mac_size = p['mac_size']
+            counts = p['counts']
+            nz = counts.nonzero(as_tuple=False).reshape(-1)
+            for idx in nz.tolist():
+                rows.append((mac_type, -1, idx - mac_size, int(counts[idx].item())))
+        return rows
+
+
+_LAYER_RE = re.compile(r'\.layer\.(\d+)\.')
+
+
+def register_mac_sites(model):
+    """Tag MAC-bearing modules with their transformer layer index.
+
+    Layer index is parsed from the module's registered name (e.g.
+    'bert.encoder.layer.7.output.dense' -> 7). Modules outside the encoder
+    stack (e.g. pooler) get -1. This avoids threading layer_idx through every
+    constructor.
+    """
+    for name, module in model.named_modules():
+        match = _LAYER_RE.search(name)
+        layer_idx = int(match.group(1)) if match else -1
+        if getattr(module, 'mac_type', None) is not None:
+            module._mac_layer_idx = layer_idx
+        if module.__class__.__name__ == 'BertSelfAttention':
+            module._mac_layer_idx = layer_idx
 
 
 def tensor_scalar(param):
