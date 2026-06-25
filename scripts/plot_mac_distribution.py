@@ -59,8 +59,10 @@ def normalized(counts):
     return [c / total for c in counts]
 
 
-def plot_mac_type(mac_type, layers, out_dir):
+def plot_mac_type(mac_type, layers, out_dir, display_name=None, slug=None):
     """layers: dict layer_idx -> {value: count}. -1 is the pooled histogram."""
+    display_name = display_name or mac_type
+    slug = slug or slugify(mac_type)
     pooled = layers.get(-1, {})
     per_layer = {k: v for k, v in layers.items() if k >= 0}
 
@@ -70,7 +72,7 @@ def plot_mac_type(mac_type, layers, out_dir):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
     fig.suptitle(
         'Binary MAC output distribution: %s  (mean=%.1f, std=%.1f, N=%d)'
-        % (mac_type, mean, std, n_samples), fontsize=13, y=1.02)
+        % (display_name, mean, std, n_samples), fontsize=13, y=1.02)
 
     # Left: pooled distribution over all layers.
     values, counts = sorted_arrays(pooled)
@@ -97,12 +99,28 @@ def plot_mac_type(mac_type, layers, out_dir):
         axes[1].legend(fontsize=6, ncol=2, loc='best')
 
     fig.tight_layout()
-    slug = slugify(mac_type)
     png_path = os.path.join(out_dir, '%s.png' % slug)
     fig.savefig(png_path, dpi=160, bbox_inches='tight')
     fig.savefig(os.path.join(out_dir, '%s.pdf' % slug), bbox_inches='tight')
     plt.close(fig)
     return png_path
+
+
+def merge_layers(data):
+    """Sum histograms across all MAC types into one layers dict.
+
+    data: mac_type -> layer_idx -> {value: count}
+    Returns: layer_idx -> {value: count}, with each value bin summed over
+    every MAC type present. layer_idx -1 (pooled-over-layers) is merged the
+    same way. NOTE: this mixes MAC sizes when types have different output
+    ranges, so the aggregate is dominated by the wider-range types.
+    """
+    merged = defaultdict(lambda: defaultdict(int))
+    for _mac_type, layers in data.items():
+        for layer_idx, value_count in layers.items():
+            for value, count in value_count.items():
+                merged[layer_idx][value] += count
+    return {k: dict(v) for k, v in merged.items()}
 
 
 def plot_comparison(data, out_dir):
@@ -173,6 +191,12 @@ def main():
         if len(data) > 1:
             cmp_png = plot_comparison(data, run_out)
             print('    wrote %s' % cmp_png)
+            merged = merge_layers(data)
+            agg_name = ' + '.join(sorted(data.keys()))
+            agg_png = plot_mac_type(
+                'aggregate', merged, run_out,
+                display_name='aggregate (%s)' % agg_name, slug='aggregate')
+            print('    wrote %s' % agg_png)
 
     print('Done. Plots saved to %s' % args.output_dir)
 
