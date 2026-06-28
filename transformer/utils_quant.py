@@ -13,6 +13,7 @@ import math
 from binary_mac_noise import (
     MacNoiseConfig,
     MacOutputCollector,
+    MacTransform,
     activation_binary_codes,
     bwn_weight_scale,
     bwn_weight_sign,
@@ -293,7 +294,8 @@ class QuantizeLinear(nn.Linear):
 
         do_noise = MacNoiseConfig.should_noise(self.mac_type)
         do_collect = MacOutputCollector.should_collect(self.mac_type)
-        if do_noise or do_collect:
+        do_transform = MacTransform.should_apply(self.mac_type)
+        if do_noise or do_collect or do_transform:
             bin_in = activation_binary_codes(
                 input_moved, input, self.input_clip_val,
                 self.symmetric, self.input_bits)
@@ -306,11 +308,15 @@ class QuantizeLinear(nn.Linear):
                 MacOutputCollector.record(
                     self.mac_type, getattr(self, '_mac_layer_idx', -1),
                     int_dot, self.in_features)
-            if do_noise:
+            if do_noise or do_transform:
                 input_scale = tensor_scalar(self.input_clip_val)
                 weight_scale = float(bwn_weight_scale(self.weight, layerwise=self.weight_layerwise))
-                noisy = MacNoiseConfig.inject(int_dot, self.in_features, self.mac_type)
-                out = input_scale * weight_scale * noisy
+                mac_out = int_dot
+                if do_noise:
+                    mac_out = MacNoiseConfig.inject(mac_out, self.in_features, self.mac_type)
+                if do_transform:
+                    mac_out = MacTransform.apply(mac_out, self.mac_type)
+                out = input_scale * weight_scale * mac_out
             else:
                 out = nn.functional.linear(input, weight)
         else:

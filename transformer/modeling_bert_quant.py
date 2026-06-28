@@ -47,7 +47,8 @@ from torch.nn.parameter import Parameter
 from .file_utils import WEIGHTS_NAME, CONFIG_NAME
 from .configuration_bert import BertConfig
 from .utils_quant import QuantizeLinear, QuantizeEmbedding, act_quant_fn, AlphaInit
-from binary_mac_noise import MacNoiseConfig, MacOutputCollector, noisy_binary_matmul, tensor_scalar
+from binary_mac_noise import (MacNoiseConfig, MacOutputCollector, MacTransform,
+                              noisy_binary_matmul, tensor_scalar, transformed_binary_matmul)
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +255,11 @@ class BertSelfAttention(nn.Module):
                 self.attention_head_size, 'attn_score',
                 tensor_scalar(self.clip_query), tensor_scalar(self.clip_key),
                 transpose_b=True)
+        elif MacTransform.should_apply('attn_score'):
+            attention_scores = transformed_binary_matmul(
+                query_layer.sign(), key_layer.sign(), 'attn_score',
+                tensor_scalar(self.clip_query), tensor_scalar(self.clip_key),
+                transpose_b=True)
         else:
             attention_scores = torch.matmul(
                 query_layer, key_layer.transpose(-1, -2))
@@ -279,6 +285,10 @@ class BertSelfAttention(nn.Module):
             context_layer = noisy_binary_matmul(
                 attention_probs.sign(), value_layer.sign(),
                 seq_len, 'attn_apply',
+                tensor_scalar(self.clip_attn), tensor_scalar(self.clip_value))
+        elif MacTransform.should_apply('attn_apply'):
+            context_layer = transformed_binary_matmul(
+                attention_probs.sign(), value_layer.sign(), 'attn_apply',
                 tensor_scalar(self.clip_attn), tensor_scalar(self.clip_value))
         else:
             context_layer = torch.matmul(attention_probs, value_layer)
