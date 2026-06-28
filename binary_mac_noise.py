@@ -206,3 +206,76 @@ def noisy_binary_matmul(sign_a, sign_b, mac_size, mac_type, scale_a, scale_b, tr
         int_out = torch.matmul(sign_a, sign_b)
     int_out = MacNoiseConfig.inject(int_out, mac_size, mac_type)
     return scale_a * scale_b * int_out
+
+
+class MacTransform(object):
+    """Deterministic, noise-free transforms applied to integer MAC outputs.
+
+    Operates in the same integer-MAC domain as MacOutputCollector, using
+    per-mac-type statistics (mean, std) measured from the noise-free network.
+    No Gaussian noise is ever applied here.
+
+    Modes:
+      - 'shift': out = int_out + multiplier * std[mac_type]
+      - 'clamp': out = clip(int_out, mean - multiplier*std, mean + multiplier*std)
+    """
+
+    enabled = False
+    mode = 'off'
+    multiplier = 0.0
+    mac_types = frozenset()
+    stats = {}
+
+    @classmethod
+    def configure(cls, mode, multiplier, mac_types, stats, enabled=True):
+        if mode not in ('shift', 'clamp'):
+            raise ValueError("mode must be 'shift' or 'clamp', got %r" % mode)
+        unknown = set(mac_types) - VALID_MAC_TYPES
+        if unknown:
+            raise ValueError(
+                'Unknown mac_types: %s. Valid: %s' % (unknown, sorted(VALID_MAC_TYPES)))
+        missing = [t for t in mac_types if t not in stats]
+        if missing:
+            raise ValueError('Missing stats (mean/std) for mac_types: %s' % missing)
+        cls.enabled = enabled
+        cls.mode = mode
+        cls.multiplier = float(multiplier)
+        cls.mac_types = frozenset(mac_types)
+        cls.stats = dict(stats)
+
+    @classmethod
+    def reset(cls):
+        cls.enabled = False
+        cls.mode = 'off'
+        cls.multiplier = 0.0
+        cls.mac_types = frozenset()
+        cls.stats = {}
+
+    @classmethod
+    def should_apply(cls, mac_type):
+        return cls.enabled and mac_type is not None and mac_type in cls.mac_types
+
+    @classmethod
+    def apply(cls, integer_output, mac_type):
+        if not cls.should_apply(mac_type):
+            return integer_output
+        st = cls.stats[mac_type]
+        mean = float(st['mean'])
+        std = float(st['std'])
+        if cls.mode == 'shift':
+            return integer_output.float() + cls.multiplier * std
+        if cls.mode == 'clamp':
+            lo = mean - cls.multiplier * std
+            hi = mean + cls.multiplier * std
+            return integer_output.float().clamp(min=lo, max=hi)
+        return integer_output
+
+
+def transformed_binary_matmul(sign_a, sign_b, mac_type, scale_a, scale_b, transpose_b=False):
+    """Integer matmul on signs, apply MacTransform, then rescale (no noise)."""
+    if transpose_b:
+        int_out = torch.matmul(sign_a, sign_b.transpose(-1, -2))
+    else:
+        int_out = torch.matmul(sign_a, sign_b)
+    int_out = MacTransform.apply(int_out, mac_type)
+    return scale_a * scale_b * int_out
